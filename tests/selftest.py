@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -454,6 +455,156 @@ def test_concurrency() -> None:
     )
 
 
+def test_pagination() -> None:
+    print("[T6] iterative classification, deep chains, paging and cursor rules")
+    reset()
+
+    # 6a: a chain longer than Python's recursion limit must no longer 500.
+    depth = 1500
+    chain = {
+        "version": "deep",
+        "services": [
+            {"name": f"s{i:05d}",
+             "dependencies": [f"s{i+1:05d}"] if i + 1 < depth else []}
+            for i in range(depth)
+        ],
+    }
+    status, body = request("POST", "/graph", chain)
+    check("deep chain graph accepted", status == 200, str(body))
+    for i in range(depth):
+        request("POST", "/reports", {"service": f"s{i:05d}", "seq": 1, "status": "fault"})
+    status, body = request("GET", "/alerts")
+    check("deep chain /alerts no longer raises recursion error", status == 200, str(body)[:200])
+    check("deep chain total path count is exact",
+          body["pagination"]["total_paths"] == depth - 1, body["pagination"])
+    check("deep chain first page is truncated", body["pagination"]["truncated"] is True)
+
+    # Walk every page: stable order, no duplicates, full coverage.
+    seen: list[tuple] = []
+    cursor = body["pagination"]["next_cursor"]
+    while cursor:
+        status, page = request("GET", "/alerts?cursor=" + urllib.parse.quote(cursor))
+        check("cursor page accepted", status == 200, str(page)[:200])
+        if status != 200:
+            break
+        for f in page["suppressed_faults"]:
+            seen.extend((f["service"], tuple(p)) for p in f["paths"])
+        if page["pagination"]["complete"]:
+            cursor = None
+        else:
+            cursor = page["pagination"]["next_cursor"]
+    first = [(f["service"], tuple(p))
+             for f in body["suppressed_faults"] for p in f["paths"]]
+    seen = first + seen
+    check("paging covers every path exactly once",
+          len(seen) == depth - 1 and len(set(seen)) == depth - 1, str(len(seen)))
+    check("global path order is stable (service then path)", seen == sorted(seen))
+
+    # 6b: branched graph with exponentially many paths never enumerates them.
+    reset()
+    layers, width = 6, 3
+    dag_layers = [[f"n{d}_{w}" for w in range(width)] for d in range(layers)]
+    branched = {
+        "version": "branch",
+        "services": [
+            {"name": n, "dependencies": dag_layers[d + 1] if d + 1 < layers else []}
+            for d, layer in enumerate(dag_layers) for n in layer
+        ],
+    }
+    status, _ = request("POST", "/graph", branched)
+    check("branched graph accepted", status == 200)
+    for layer in dag_layers:
+        for n in layer:
+            request("POST", "/reports", {"service": n, "seq": 1, "status": "fault"})
+    status, body = request("GET", "/alerts")
+    per_top = width ** (layers - 1)
+    expected_total = sum(width * (width ** (layers - 1 - d)) for d in range(layers - 1))
+    check("exponential path count computed without enumeration",
+          status == 200 and body["pagination"]["total_paths"] == expected_total,
+          body.get("pagination"))
+    check("per-service path count exposed",
+          body["pagination"]["path_counts"]["n0_0"] == per_top)
+    check("large result is never faked as complete",
+          body["pagination"]["truncated"] and body["pagination"]["next_cursor"])
+
+    # Small explicit limit keeps its size across cursor-only follow-ups.
+    status, p1 = request("GET", "/alerts?limit=2")
+    check("explicit limit honored", p1["pagination"]["limit"] == 2
+          and p1["pagination"]["returned_paths"] == 2)
+    cursor = p1["pagination"]["next_cursor"]
+    status, p2 = request("GET", "/alerts?cursor=" + urllib.parse.quote(cursor))
+    check("cursor-only follow-up keeps the embedded page size",
+          status == 200 and p2["pagination"]["limit"] == 2
+          and p2["pagination"]["offset"] == 2, str(p2.get("pagination")))
+
+    # 6c: cursor invalidation semantics on a small diamond.
+    reset()
+    diamond = {
+        "version": "d1",
+        "services": [
+            {"name": "A", "dependencies": ["B", "C"]},
+            {"name": "B", "dependencies": ["D"]},
+            {"name": "C", "dependencies": ["D"]},
+            {"name": "D", "dependencies": []},
+        ],
+    }
+    request("POST", "/graph", diamond)
+    for n in ("A", "B", "C", "D"):
+        request("POST", "/reports", {"service": n, "seq": 1, "status": "fault"})
+    status, first = request("GET", "/alerts?limit=1")
+    cur = first["pagination"]["next_cursor"]
+    check("diamond page 1 truncated", bool(cur))
+
+    status, _ = request("POST", "/reports", {"service": "A", "seq": 1, "status": "fault"})
+    check("duplicate retry stays accepted", status == 200)
+    status, page = request("GET", "/alerts?cursor=" + urllib.parse.quote(cur))
+    check("duplicate retry does not invalidate cursor", status == 200, str(page)[:200])
+
+    status, _ = request("POST", "/reports", {"service": "A", "seq": 1, "status": "recover"})
+    check("conflicting report rejected", status == 409)
+    status, page = request("GET", "/alerts?cursor=" + urllib.parse.quote(cur))
+    check("rejected report does not invalidate cursor", status == 200, str(page)[:200])
+
+    status, _ = request("POST", "/reports", {"service": "A", "seq": 2, "status": "recover"})
+    check("applied report accepted", status == 200)
+    status, page = request("GET", "/alerts?cursor=" + urllib.parse.quote(cur))
+    check("applied report invalidates cursor",
+          status == 409 and page["error"] == "stale_cursor", str(page)[:200])
+
+    status, fresh = request("GET", "/alerts?limit=1")
+    cur2 = fresh["pagination"]["next_cursor"]
+    status, _ = request("POST", "/graph", {
+        "version": "d2",
+        "services": [
+            {"name": "A", "dependencies": ["B"]},
+            {"name": "B", "dependencies": []},
+            {"name": "C", "dependencies": ["D"]},
+            {"name": "D", "dependencies": []},
+        ],
+    })
+    check("graph replacement accepted", status == 200)
+    status, page = request("GET", "/alerts?cursor=" + urllib.parse.quote(cur2))
+    check("graph replacement invalidates cursor",
+          status == 409 and page["error"] == "stale_cursor", str(page)[:200])
+
+    status, page = request("GET", "/alerts?cursor=garbage-token")
+    check("malformed cursor rejected as invalid_cursor",
+          status == 400 and page["error"] == "invalid_cursor", str(page)[:200])
+
+    # 6d: small graph legacy response keeps its original, unpaginated shape.
+    reset()
+    request("POST", "/graph", diamond)
+    for n in ("A", "B", "C", "D"):
+        request("POST", "/reports", {"service": n, "seq": 1, "status": "fault"})
+    status, body = request("GET", "/alerts")
+    check("small legacy response has no pagination block", "pagination" not in body, str(body)[:200])
+    a = next(f for f in body["suppressed_faults"] if f["service"] == "A")
+    check("legacy paths unchanged and fully listed",
+          a["paths"] == [["A", "B", "D"], ["A", "C", "D"]], str(a))
+    status, _ = request("GET", "/alerts?limit=0")
+    check("limit below range rejected", status == 422)
+
+
 def main() -> int:
     print(f"Self-test against {BASE_URL}\n")
     try:
@@ -467,6 +618,7 @@ def main() -> int:
     test_suppression()
     test_graph_replace_preserves_state()
     test_concurrency()
+    test_pagination()
 
     print(f"\n{'-' * 60}\nPASS={PASS} FAIL={FAIL}")
     if FAIL:

@@ -3,12 +3,25 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
+from .cursors import rotate_secret
 from .database import close_connection, get_connection, init_db, write_tx
-from .errors import GraphError, NoGraph, ReportConflict, UnknownService
-from .graph_service import classify_alerts, get_graph, replace_graph
+from .errors import (
+    GraphError,
+    InvalidCursor,
+    NoGraph,
+    ReportConflict,
+    StaleCursor,
+    UnknownService,
+)
+from .graph_service import (
+    MAX_PAGE_LIMIT,
+    get_graph,
+    query_alerts,
+    replace_graph,
+)
 from .report_service import submit_report
 from .schemas import (
     AlertsResponse,
@@ -79,6 +92,22 @@ async def _no_graph(_: Request, exc: NoGraph):
     )
 
 
+@app.exception_handler(InvalidCursor)
+async def _invalid_cursor(_: Request, exc: InvalidCursor):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
+@app.exception_handler(StaleCursor)
+async def _stale_cursor(_: Request, exc: StaleCursor):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
 @app.post("/graph", response_model=ReplaceResponse, status_code=200)
 def put_graph(payload: GraphPayload) -> ReplaceResponse:
     """Replace the **whole** dependency graph.
@@ -102,10 +131,42 @@ def post_report(payload: ReportPayload) -> ReportResponse:
     return ReportResponse(**submit_report(payload))
 
 
-@app.get("/alerts", response_model=AlertsResponse)
-def read_alerts() -> AlertsResponse:
-    """Return actionable faults, suppressed faults and their upstream root causes."""
-    return AlertsResponse(**classify_alerts())
+@app.get(
+    "/alerts",
+    response_model=AlertsResponse,
+    # Keeps legacy responses byte-for-byte identical: the optional pagination
+    # block is omitted entirely unless the result is actually paged.
+    response_model_exclude_unset=True,
+    responses={
+        400: {"description": "Malformed or forged pagination cursor"},
+        409: {"description": "Stale cursor (graph revision or fault state changed)"},
+    },
+)
+def read_alerts(
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=MAX_PAGE_LIMIT,
+        description=(
+            "Maximum suppression paths per page. Omit it for legacy behaviour: "
+            "small graphs return every path without a pagination block; large "
+            "ones return the first page plus a next_cursor."
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque next_cursor token returned by a previous /alerts page.",
+    ),
+) -> AlertsResponse:
+    """Return actionable faults, suppressed faults and their upstream root causes.
+
+    Fault classification (actionable / suppressed / root cause) is unchanged;
+    only the potentially exponential path lists are paged.  Each cursor pins
+    the graph revision and fault-state version it was issued for: a graph
+    replacement or an applied report invalidates it (409 stale_cursor), while
+    duplicate retries and rejected reports do not.
+    """
+    return AlertsResponse(**query_alerts(limit=limit, cursor=cursor))
 
 
 @app.post("/admin/reset", status_code=200)
@@ -117,6 +178,9 @@ def admin_reset() -> dict:
         conn.execute("DELETE FROM edges")
         conn.execute("DELETE FROM nodes")
         conn.execute("DELETE FROM graph_meta")
+        # Rotate the cursor secret as well so tokens issued before the reset
+        # cannot be replayed against the freshly initialised database.
+        rotate_secret(conn)
     return {"reset": True}
 
 

@@ -48,6 +48,29 @@ class SuppressedFault(BaseModel):
     paths: list[list[str]]
 
 
+class PaginationInfo(BaseModel):
+    limit: int = Field(..., description="Maximum paths returned on this page")
+    offset: int = Field(..., description="Global flat path offset of this page")
+    next_offset: int = Field(..., description="Offset the next_cursor continues from")
+    returned_paths: int = Field(..., description="Number of paths included on this page")
+    total_paths: int = Field(
+        ...,
+        description=(
+            "Total number of all-faulty suppression paths across all pages. "
+            "An arbitrarily large Python integer on highly branched graphs."
+        ),
+    )
+    path_counts: dict[str, int] = Field(
+        ..., description="Total all-faulty path count per suppressed service"
+    )
+    complete: bool = Field(..., description="True when this is the final page")
+    truncated: bool = Field(..., description="True when further pages exist")
+    next_cursor: Optional[str] = Field(
+        ..., description="Opaque token for the next page; null when complete"
+    )
+    hint: Optional[str] = None
+
+
 class AlertsResponse(BaseModel):
     graph_revision: int
     graph_version: Optional[str]
@@ -57,6 +80,8 @@ class AlertsResponse(BaseModel):
     down_services: list[str]
     unreported_services: list[str]
     healthy_services: list[str]
+    # Absent on legacy (parameter-less) responses whose paths fit one page.
+    pagination: Optional[PaginationInfo] = None
 
 
 class GraphResponse(BaseModel):

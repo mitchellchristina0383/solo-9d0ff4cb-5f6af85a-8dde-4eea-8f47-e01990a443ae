@@ -37,8 +37,8 @@ ALERT_DB_PATH=./data/alerts.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/graph` | 整版替换依赖图。校验失败（环路 / 未知引用 / 重名 / 重边 / 自依赖）返回 `422` 并**保留旧版** |
 | `GET` | `/graph` | 读取当前已提交图（含内部修订号 `revision`） |
 | `POST` | `/reports` | 上报故障 / 恢复 |
-| `GET` | `/alerts` | 查询告警分类（需处理 / 被抑制 / 根因 / 路径） |
-| `POST` | `/admin/reset` | 清空全部数据（测试 / 运维辅助） |
+| `GET` | `/alerts` | 查询告警分类（需处理 / 被抑制 / 根因 / 路径，路径支持游标分页） |
+| `POST` | `/admin/reset` | 清空全部数据（测试 / 运维辅助，同时作废旧游标） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交依赖图
@@ -102,6 +102,52 @@ GET /alerts
 }
 ```
 
+### 路径分页（深链与高分叉）
+
+分类（需处理 / 被抑制 / 根因）始终在一次查询内完整计算且语义不变；可能指数膨胀的
+只有被抑制故障的 `paths`。路径计算全部改为**迭代实现**（拓扑序 + 组合数计数 /
+反解），千级深度的依赖链不再触发递归深度错误，高分叉图也不会一次性枚举全部路径。
+
+- **无参数 `GET /alerts`（兼容旧行为）**：当全部全故障路径不超过 100 条时，响应与
+  旧版完全一致（没有 `pagination` 字段）。超过 100 条时返回**首页**并附带
+  `pagination` 块与 `next_cursor`，明确提示结果分页——绝不截断后冒充完整结果。
+- **`GET /alerts?limit=N`**：`N` 取值 1–1000，按稳定顺序返回至多 N 条路径（服务按
+  名称排序，服务内路径按字典序）。
+- **翻页**：把上一页的 `next_cursor` 原样回传
+  （`GET /alerts?cursor=<token>`）。游标内固化了页大小，只带游标翻页时仍按原 `limit`
+  分页；也可显式传入新的 `limit` 覆盖。
+- 游标是 HMAC 签名的不透明令牌，内含 `(graph_revision, state_version, offset, limit)`：
+  - 依赖图换版（`revision` 变化）或有**生效的**新上报（`state_version` 变化）后，旧游标
+    立即失效，返回 `409 stale_cursor`，要求从无游标查询重新开始，避免拼接不同状态的路径；
+  - 同序号幂等重试、被 409/422 拒绝的上报不改变任何版本号，**游标保持有效**；
+  - 伪造或损坏的游标返回 `400 invalid_cursor`；`/admin/reset` 会轮换签名密钥，旧令牌
+    一律作废。
+- 每次请求仍在单个读事务快照内完成，游标只记录偏移，不缓存任何路径；除当前页外不会
+  枚举其他页的路径。
+
+分页响应在原有字段之外增加：
+
+```json
+{
+  "...": "分类字段与旧版相同（本页之外的 suppressed 服务 paths 为空数组）",
+  "pagination": {
+    "limit": 100,
+    "offset": 0,
+    "next_offset": 100,
+    "returned_paths": 100,
+    "total_paths": 4096,
+    "path_counts": {"A": 2048, "B": 2048},
+    "complete": false,
+    "truncated": true,
+    "next_cursor": "eyJ...签名令牌",
+    "hint": "result is paginated: repeat GET /alerts with cursor=next_cursor ..."
+  }
+}
+```
+
+`total_paths` 是全部全故障路径的总数（高分叉时可以是任意大的整数，仅计数不枚举）；
+最后一页 `complete=true`、`next_cursor=null`。
+
 ## 抑制规则（核心语义）
 
 1. 只有当前仍处于故障（down）状态的服务才会出现在 `actionable_faults` 或
@@ -139,16 +185,19 @@ BASE_URL=http://localhost:8000 python tests/selftest.py
 ```
 
 覆盖：图校验与原子替换、序号幂等 / 冲突 / 迟到语义、全故障路径抑制与健康 / 未上报截断、
-恢复即时重分类、换版状态保留，以及同序号并发重试、同序号异内容竞争、多序号乱序竞争、
-并发换版、换版与查询交错等关键并发场景（共 55 项断言）。
+恢复即时重分类、换版状态保留，同序号并发重试、同序号异内容竞争、多序号乱序竞争、
+并发换版、换版与查询交错等关键并发场景，以及千级深链、高分叉计数 / 反解、路径分页、
+游标失效（换版 / 生效上报失效，幂等重试 / 被拒上报不失效）与伪造游标等场景
+（共 94 项断言）。
 
 ## 目录结构
 
 ```
 app/
   main.py            FastAPI 路由与异常映射
-  database.py        SQLite 连接、schema、事务管理
-  graph_service.py   图校验、整版替换、告警分类
+  database.py        SQLite 连接、schema、事务管理、状态版本
+  graph_service.py   图校验、整版替换、迭代告警分类与分页反解
+  cursors.py         HMAC 签名的不透明分页游标
   report_service.py  上报序号语义
   schemas.py         Pydantic 模型
   errors.py          领域错误

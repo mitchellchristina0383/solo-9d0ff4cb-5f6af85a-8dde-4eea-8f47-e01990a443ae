@@ -28,3 +28,17 @@ class NoGraph(Exception):
 
     status_code = 409
     code = "no_graph"
+
+
+class InvalidCursor(Exception):
+    """Pagination cursor is malformed, forged or otherwise unusable."""
+
+    status_code = 400
+    code = "invalid_cursor"
+
+
+class StaleCursor(Exception):
+    """Cursor was valid once, but its graph revision or state version changed."""
+
+    status_code = 409
+    code = "stale_cursor"

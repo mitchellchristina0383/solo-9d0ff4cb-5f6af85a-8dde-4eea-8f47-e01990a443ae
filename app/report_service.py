@@ -1,7 +1,7 @@
 """Fault/recovery report processing with per-service monotonic sequence numbers."""
 from __future__ import annotations
 
-from .database import write_tx
+from .database import bump_state_version, write_tx
 from .errors import ReportConflict, UnknownService
 from .schemas import ReportPayload
 
@@ -61,6 +61,10 @@ def submit_report(payload: ReportPayload) -> dict:
                 "last_seq = excluded.last_seq",
                 (payload.service, wanted, payload.seq),
             )
+            # Only effective writes advance the state version; duplicate
+            # retries and rejected reports keep it (and therefore keep any
+            # outstanding pagination cursor valid).
+            bump_state_version(conn)
             applied = True
             duplicate = False
             current_status = wanted

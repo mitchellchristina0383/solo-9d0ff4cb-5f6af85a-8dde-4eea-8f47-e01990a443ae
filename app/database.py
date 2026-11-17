@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS events (
     applied         INTEGER NOT NULL,
     recorded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Single-row bookkeeping for read-side consistency.  ``state_version`` is the
+-- version of the fault/recovery *state*: it advances exactly when a report is
+-- applied (a write that changes ``service_state``), and stays untouched by
+-- idempotent retries, rejected/conflicting reports and graph replacements.
+-- Pagination cursors pin (revision, state_version); any state-changing write
+-- therefore invalidates outstanding cursors, while duplicate or rejected
+-- reports do not.
+CREATE TABLE IF NOT EXISTS query_meta (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    state_version   INTEGER NOT NULL DEFAULT 0,
+    cursor_secret   TEXT
+);
 """
 
 _local = threading.local()
@@ -87,8 +100,46 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA)
+        # Upgrade path for databases created before query_meta existed.
+        conn.execute(
+            "INSERT INTO query_meta (id, state_version) VALUES (1, 0) "
+            "ON CONFLICT(id) DO NOTHING"
+        )
+        # And for databases whose query_meta predates the cursor_secret column.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(query_meta)")}
+        if "cursor_secret" not in cols:
+            conn.execute("ALTER TABLE query_meta ADD COLUMN cursor_secret TEXT")
+        # Generate the cursor signing secret at startup (autocommit) so that
+        # read-only /alerts requests never have to perform a write just to
+        # issue their first cursor.
+        from .cursors import get_or_create_secret
+
+        get_or_create_secret(conn)
     finally:
         close_connection()
+
+
+def get_state_version(conn: sqlite3.Connection) -> int:
+    """Return the current fault-state version (0 when nothing applied yet)."""
+    row = conn.execute("SELECT state_version FROM query_meta WHERE id = 1").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO query_meta (id, state_version) VALUES (1, 0) "
+            "ON CONFLICT(id) DO NOTHING"
+        )
+        return 0
+    return row["state_version"]
+
+
+def bump_state_version(conn: sqlite3.Connection) -> int:
+    """Advance the fault-state version inside an open write transaction."""
+    conn.execute(
+        "INSERT INTO query_meta (id, state_version) VALUES (1, 1) "
+        "ON CONFLICT(id) DO UPDATE SET state_version = state_version + 1"
+    )
+    return conn.execute("SELECT state_version FROM query_meta WHERE id = 1").fetchone()[
+        "state_version"
+    ]
 
 
 @contextmanager
